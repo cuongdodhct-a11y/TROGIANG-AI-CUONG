@@ -1,0 +1,10 @@
+{
+  "name": "Remix: Giáo sư Triết học số - Trợ giảng AI",
+  "description": "Ứng dụng tương tác giọng nói với Avatar AI đóng vai trò nữ giáo sư triết học Việt Nam, hỗ trợ giảng dạy các chuyên đề Triết học Mác-Lênin.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
