@@ -111,10 +111,11 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
             if (inputTranscription) {
               setTranscription(inputTranscription);
               const textLower = inputTranscription.toLowerCase();
-              if (textLower.includes("giáo sư")) {
+              if (textLower.includes("giáo sư") || textLower.includes("giao su")) {
                 setActivationState('active');
-              } else if (textLower.includes("kết thúc") || textLower.includes("dừng") || textLower.includes("ngắt")) {
+              } else if (textLower.includes("kết thúc") || textLower.includes("dừng") || textLower.includes("ngắt") || textLower.includes("stop")) {
                 setActivationState('standby');
+                stopPlayback();
               }
             }
 
@@ -373,11 +374,32 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                       {activationState === 'active' ? 'Trạng thái: Đã kích hoạt' : 'Trạng thái: Đang chờ từ khóa'}
                     </span>
                   </div>
-                  <p className="text-xs">
+                  <p className="text-xs mb-3">
                     {activationState === 'active'
                       ? 'Đang duy trì hội thoại liên tục. Nói "Kết thúc" hoặc "Dừng" để quay lại trạng thái chờ.'
                       : 'Bắt đầu câu nói bằng "Giáo sư..." để kích hoạt. Tạp âm và câu nói không gọi Giáo sư sẽ bị bỏ qua.'}
                   </p>
+                  <div className="flex justify-center gap-2 pt-1 border-t border-amber-200/60">
+                    <Button 
+                      size="sm" 
+                      variant="outline"
+                      onClick={() => setActivationState('active')}
+                      className={`text-xs h-7 px-3 ${activationState === 'active' ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700' : 'bg-white border-amber-300 text-amber-900 hover:bg-amber-100'}`}
+                    >
+                      Gọi "Giáo sư..." (Kích hoạt)
+                    </Button>
+                    <Button 
+                      size="sm" 
+                      variant="outline"
+                      onClick={() => {
+                        setActivationState('standby');
+                        stopPlayback();
+                      }}
+                      className={`text-xs h-7 px-3 ${activationState === 'standby' ? 'bg-amber-600 text-white border-amber-600 hover:bg-amber-700' : 'bg-white border-amber-300 text-amber-900 hover:bg-amber-100'}`}
+                    >
+                      Nói "Dừng / Kết thúc" (Trạng thái chờ)
+                    </Button>
+                  </div>
                 </div>
 
                 <div className="flex justify-center items-center gap-12 pt-2">
@@ -395,11 +417,20 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                     )}
                   </div>
 
-                  <div className="relative text-center">
+                  <div className="relative text-center flex flex-col items-center">
                     <div className={`w-28 h-28 rounded-full flex items-center justify-center transition-all duration-500 mx-auto p-1 bg-white shadow-md border-2 ${isAiSpeaking ? 'border-amber-500 ring-4 ring-amber-300/60' : 'border-stone-200'}`}>
-                      <SchoolLogo className="w-full h-full" animated={false} />
+                      <SchoolLogo className="w-full h-full" animated={false} showNameTag={false} />
                     </div>
-                    <span className="text-xs font-semibold text-stone-600 mt-2 block">
+                    
+                    {/* Prominent Name Tag under active avatar */}
+                    <div className="mt-2.5 px-3 py-1 bg-[#121E17] border border-[#F9B217] rounded-full shadow-md flex items-center gap-1.5 z-10">
+                      <span className="w-2 h-2 rounded-full bg-[#F9B217] animate-pulse shrink-0" />
+                      <span className="font-serif font-bold text-white tracking-widest text-[11px] md:text-xs">
+                        ĐỖ ĐÌNH CƯỜNG
+                      </span>
+                    </div>
+
+                    <span className="text-xs font-semibold text-stone-600 mt-1.5 block">
                       {isAiSpeaking ? "Giáo sư đang giảng..." : "Giáo sư Triết học số"}
                     </span>
                     {isAiSpeaking && (
