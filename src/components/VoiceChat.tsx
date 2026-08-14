@@ -1,13 +1,14 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Mic, MicOff, Volume2, VolumeX, Loader2, MessageSquare } from "lucide-react";
+import { Mic, MicOff, Loader2, Play, PauseCircle, Sparkles, RefreshCw, Radio, CheckCircle2 } from "lucide-react";
 import { arrayBufferToBase64, base64ToArrayBuffer, float32ToInt16, int16ToFloat32 } from "@/src/lib/audio-utils";
 import { motion, AnimatePresence } from "motion/react";
 import SchoolLogo from './SchoolLogo';
 
-const MODEL_NAME = "gemini-3.1-flash-live-preview";
+const LIVE_MODEL_NAME = "gemini-3.1-flash-live-preview";
+const FALLBACK_MODEL_NAME = "gemini-3.7-flash";
 
 const WORKLET_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
@@ -49,6 +50,12 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [activationState, setActivationState] = useState<'standby' | 'active'>('standby');
   const [error, setError] = useState<string | null>(null);
+  const [engineMode, setEngineMode] = useState<'live' | 'standard'>('live');
+  const [isAiThinking, setIsAiThinking] = useState(false);
+
+  const activationStateRef = useRef<'standby' | 'active'>('standby');
+  const isMutedRef = useRef(false);
+  const engineModeRef = useRef<'live' | 'standard'>('live');
 
   const aiRef = useRef<any>(null);
   const sessionRef = useRef<any>(null);
@@ -59,23 +66,243 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   const nextPlaybackTimeRef = useRef(0);
   const speakingTimeoutRef = useRef<any>(null);
   const isSessionActiveRef = useRef(false);
+  const speechRecognizerRef = useRef<any>(null);
+  const isProcessingFallbackRef = useRef(false);
+  const reconnectTimeoutRef = useRef<any>(null);
 
-  const startConnection = async () => {
-    if (isConnecting || isConnected) return;
-    setError(null);
-    setIsConnecting(true);
-    setActivationState('standby');
+  const updateActivationState = (newState: 'standby' | 'active') => {
+    activationStateRef.current = newState;
+    setActivationState(newState);
+    if (newState === 'standby') {
+      stopPlayback();
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+    }
+  };
+
+  const isWakeWord = (text: string): boolean => {
+    const t = text.toLowerCase().trim();
+    return (
+      t.includes("giáo sư") || 
+      t.includes("giao su") || 
+      t.includes("thưa giáo sư") || 
+      t.includes("thay giao su") ||
+      t.includes("chào giáo sư") ||
+      t.includes("bác giáo sư") ||
+      t.includes("cô giáo sư")
+    );
+  };
+
+  const isStopWord = (text: string): boolean => {
+    const t = text.toLowerCase().trim();
+    return (
+      t.includes("kết thúc") ||
+      t.includes("ket thuc") ||
+      t.includes("dừng lại") ||
+      t.includes("dung lai") ||
+      t.includes("dừng") ||
+      t.includes("dung") ||
+      t.includes("tạm dừng") ||
+      t.includes("tam dung") ||
+      t.includes("ngắt lời") ||
+      t.includes("ngắt") ||
+      t.includes("về chế độ chờ") ||
+      t.includes("stop")
+    );
+  };
+
+  // Speaks text using browser SpeechSynthesis with Vietnamese voice
+  const speakText = (text: string) => {
+    if (!('speechSynthesis' in window) || activationStateRef.current !== 'active') return;
+
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'vi-VN';
+    utterance.rate = 0.95;
+    utterance.pitch = 0.95;
+
+    const voices = window.speechSynthesis.getVoices();
+    const viVoice = voices.find(v => v.lang.includes('vi') || v.lang.includes('VI'));
+    if (viVoice) {
+      utterance.voice = viVoice;
+    }
+
+    utterance.onstart = () => {
+      setIsAiSpeaking(true);
+    };
+
+    utterance.onend = () => {
+      setIsAiSpeaking(false);
+    };
+
+    utterance.onerror = () => {
+      setIsAiSpeaking(false);
+    };
+
+    window.speechSynthesis.speak(utterance);
+  };
+
+  // Process user speech when using Fallback Standard Engine with Real-Time Google Search Grounding
+  const processFallbackTurn = async (userPrompt: string) => {
+    if (isProcessingFallbackRef.current || !aiRef.current || isMutedRef.current) return;
+    isProcessingFallbackRef.current = true;
+    setIsAiThinking(true);
 
     try {
-      // Request microphone permission immediately on user gesture
+      const response = await aiRef.current.models.generateContent({
+        model: FALLBACK_MODEL_NAME,
+        contents: [
+          { role: 'user', parts: [{ text: userPrompt }] }
+        ],
+        config: {
+          systemInstruction,
+          tools: [{ googleSearch: {} }],
+        }
+      });
+
+      const replyText = response.text || "";
+      if (replyText) {
+        setAiTranscription(replyText);
+        
+        // If activated, speak out the answer
+        if (activationStateRef.current === 'active') {
+          speakText(replyText);
+        }
+
+        // Check if reply instructs return to standby
+        if (replyText.toLowerCase().includes("trạng thái chờ") || replyText.toLowerCase().includes("chế độ chờ")) {
+          setTimeout(() => {
+            updateActivationState('standby');
+          }, 3000);
+        }
+      }
+    } catch (err: any) {
+      console.error("Fallback generateContent error:", err);
+    } finally {
+      setIsAiThinking(false);
+      isProcessingFallbackRef.current = false;
+    }
+  };
+
+  // Continuous speech recognition for keyword detection & fallback input
+  const startSpeechRecognition = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    try {
+      if (speechRecognizerRef.current) {
+        speechRecognizerRef.current.abort();
+      }
+
+      const recognizer = new SpeechRecognition();
+      recognizer.continuous = true;
+      recognizer.interimResults = true;
+      recognizer.lang = 'vi-VN';
+
+      recognizer.onresult = (event: any) => {
+        let currentTranscript = "";
+        let isFinal = false;
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          currentTranscript += event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            isFinal = true;
+          }
+        }
+
+        const trimmed = currentTranscript.trim();
+        if (trimmed) {
+          setTranscription(trimmed);
+
+          if (isWakeWord(trimmed)) {
+            console.log("Keyword detected: Giáo sư -> ACTIVATE");
+            updateActivationState('active');
+          } else if (isStopWord(trimmed)) {
+            console.log("Keyword detected: Dừng/Kết thúc -> STANDBY");
+            updateActivationState('standby');
+            if ('speechSynthesis' in window) {
+              window.speechSynthesis.cancel();
+            }
+            return;
+          }
+
+          // If in standard fallback mode and user finished speaking while active, send to Gemini
+          if (engineModeRef.current === 'standard' && isFinal && activationStateRef.current === 'active') {
+            processFallbackTurn(trimmed);
+          }
+        }
+      };
+
+      recognizer.onerror = (e: any) => {
+        if (e.error !== 'no-speech') {
+          console.log("Speech recognition notice:", e.error);
+        }
+      };
+
+      recognizer.onend = () => {
+        if (isSessionActiveRef.current) {
+          try {
+            recognizer.start();
+          } catch (err) {}
+        }
+      };
+
+      recognizer.start();
+      speechRecognizerRef.current = recognizer;
+    } catch (e) {
+      console.warn("Speech recognition initialization skipped:", e);
+    }
+  };
+
+  const stopSpeechRecognition = () => {
+    if (speechRecognizerRef.current) {
+      try {
+        speechRecognizerRef.current.abort();
+      } catch (e) {}
+      speechRecognizerRef.current = null;
+    }
+  };
+
+  // Start with Fallback Mode directly
+  const startFallbackConnection = async () => {
+    try {
+      setEngineMode('standard');
+      engineModeRef.current = 'standard';
+      setIsConnecting(false);
+      setIsConnected(true);
+      isSessionActiveRef.current = true;
+      updateActivationState('standby');
+      startSpeechRecognition();
+      setError(null);
+    } catch (err) {
+      setError("Không thể khởi tạo micro. Vui lòng cấp quyền micro trên trình duyệt.");
+      setIsConnecting(false);
+    }
+  };
+
+  const startConnection = async (preferLive = true) => {
+    if (isConnecting) return;
+    setError(null);
+    setIsConnecting(true);
+    updateActivationState('standby');
+
+    try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
       aiRef.current = ai;
 
+      if (!preferLive) {
+        startFallbackConnection();
+        return;
+      }
+
+      // Connect to Live API
+      let hasOpened = false;
       const sessionPromise = ai.live.connect({
-        model: MODEL_NAME,
+        model: LIVE_MODEL_NAME,
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -88,6 +315,9 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
         callbacks: {
           onopen: () => {
             console.log("Live API connected");
+            hasOpened = true;
+            setEngineMode('live');
+            engineModeRef.current = 'live';
             setIsConnected(true);
             isSessionActiveRef.current = true;
             setIsConnecting(false);
@@ -95,81 +325,110 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
             sessionPromise.then(session => {
               sessionRef.current = session;
               startMic(session);
+              startSpeechRecognition();
             });
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle audio output
-            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
-              const audioData = base64ToArrayBuffer(base64Audio);
-              const float32Data = int16ToFloat32(new Int16Array(audioData));
-              scheduleAudio(float32Data);
-            }
-
-            // Handle input transcription and keyword detection
             const inputTranscription = (message as any).serverContent?.inputAudioTranscription?.transcription;
             if (inputTranscription) {
               setTranscription(inputTranscription);
-              const textLower = inputTranscription.toLowerCase();
-              if (textLower.includes("giáo sư") || textLower.includes("giao su")) {
-                setActivationState('active');
-              } else if (textLower.includes("kết thúc") || textLower.includes("dừng") || textLower.includes("ngắt") || textLower.includes("stop")) {
-                setActivationState('standby');
-                stopPlayback();
+              if (isWakeWord(inputTranscription)) {
+                updateActivationState('active');
+              } else if (isStopWord(inputTranscription)) {
+                updateActivationState('standby');
               }
             }
 
-            // Handle output transcription
+            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (base64Audio) {
+              if (activationStateRef.current === 'active') {
+                const audioData = base64ToArrayBuffer(base64Audio);
+                const float32Data = int16ToFloat32(new Int16Array(audioData));
+                scheduleAudio(float32Data);
+              }
+            }
+
             const outputTranscription = (message as any).serverContent?.modelTurn?.parts?.find((p: any) => p.text)?.text;
             if (outputTranscription) {
-              setAiTranscription(prev => prev + " " + outputTranscription);
-              setActivationState('active');
+              setAiTranscription(prev => prev ? prev + " " + outputTranscription : outputTranscription);
+              if (outputTranscription.toLowerCase().includes("trạng thái chờ") || outputTranscription.toLowerCase().includes("chế độ chờ")) {
+                setTimeout(() => {
+                  updateActivationState('standby');
+                }, 2500);
+              }
             }
 
             if (message.serverContent?.interrupted) {
               stopPlayback();
             }
           },
-          onerror: (error) => {
-            console.error("Live API error:", error);
-            setError("Lỗi kết nối AI. Vui lòng thử lại.");
-            stopConnection();
+          onerror: (error: any) => {
+            console.warn("Live API encounter:", error);
+            const errStr = String(error?.message || error || "");
+            
+            // If service unavailable or transient error, automatically switch to reliable fallback engine!
+            if (!hasOpened || errStr.includes("unavailable") || errStr.includes("Network") || errStr.includes("503")) {
+              console.log("Switching to Standard Gemini AI Engine due to Live API temporary unavailability...");
+              setError("Live Audio máy chủ đang bảo trì/quá tải. Đã chuyển sang Chế độ Giọng nói Dự phòng độ ổn định cao.");
+              startFallbackConnection();
+            } else {
+              setError("Đang tự động kết nối lại...");
+              clearTimeout(reconnectTimeoutRef.current);
+              reconnectTimeoutRef.current = setTimeout(() => {
+                startConnection(false);
+              }, 2000);
+            }
           },
           onclose: () => {
             console.log("Live API closed");
-            stopConnection();
+            if (isSessionActiveRef.current && engineModeRef.current === 'live') {
+              startFallbackConnection();
+            }
           },
         },
       });
 
+      // Timeout safeguard in case websocket stalls
+      setTimeout(() => {
+        if (!hasOpened && isSessionActiveRef.current === false && isConnecting) {
+          console.log("Live API connection timeout -> switching to Standard Engine");
+          startFallbackConnection();
+        }
+      }, 5000);
+
     } catch (error: any) {
-      console.error("Failed to connect to Live API:", error);
+      console.error("Failed to connect:", error);
       if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-        setError("Không thể truy cập micro. Vui lòng kiểm tra cài đặt trình duyệt và cho phép ứng dụng sử dụng micro.");
+        setError("Không thể truy cập micro. Vui lòng cấp quyền micro cho trang web.");
+        setIsConnecting(false);
       } else {
-        setError("Không thể khởi tạo kết nối. Vui lòng thử lại.");
-      }
-      setIsConnecting(false);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
+        // Fallback to Standard Voice Chat
+        startFallbackConnection();
       }
     }
   };
 
   const stopConnection = () => {
     isSessionActiveRef.current = false;
+    clearTimeout(reconnectTimeoutRef.current);
+    stopSpeechRecognition();
     if (sessionRef.current) {
-      sessionRef.current.close();
+      try {
+        sessionRef.current.close();
+      } catch (e) {}
       sessionRef.current = null;
     }
     stopMic();
     stopPlayback();
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
     setIsConnected(false);
     setIsConnecting(false);
-    setActivationState('standby');
+    updateActivationState('standby');
     setTranscription("");
     setAiTranscription("");
+    setIsAiThinking(false);
   };
 
   const startMic = async (session: any) => {
@@ -192,7 +451,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       workletNodeRef.current = workletNode;
 
       workletNode.port.onmessage = (e) => {
-        if (isMuted || !isSessionActiveRef.current || session !== sessionRef.current) return;
+        if (isMutedRef.current || !isSessionActiveRef.current || session !== sessionRef.current) return;
 
         const inputData = e.data;
         const int16Data = float32ToInt16(inputData);
@@ -203,25 +462,20 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
             audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
           });
           
-          // Handle potential async return
           if (result instanceof Promise) {
-            result.catch((err: any) => {
-              console.error("Async error sending audio input:", err);
-              isSessionActiveRef.current = false;
-              stopConnection();
+            result.catch(() => {
+              // Ignore non-fatal frame drops
             });
           }
         } catch (err) {
-          console.error("Error sending audio input:", err);
-          isSessionActiveRef.current = false;
-          stopConnection();
+          // Handled gracefully
         }
       };
 
       source.connect(workletNode);
       workletNode.connect(audioContext.destination);
     } catch (error) {
-      console.error("Failed to start microphone:", error);
+      console.error("Failed to start microphone stream:", error);
     }
   };
 
@@ -235,12 +489,14 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       workletNodeRef.current = null;
     }
     if (audioContextRef.current) {
-      audioContextRef.current.close();
+      audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
   };
 
   const scheduleAudio = (float32Data: Float32Array) => {
+    if (activationStateRef.current !== 'active') return;
+
     if (!playbackContextRef.current) {
       playbackContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       nextPlaybackTimeRef.current = playbackContextRef.current.currentTime;
@@ -251,9 +507,8 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       playCtx.resume();
     }
 
-    // Ensure we don't schedule in the past
     if (nextPlaybackTimeRef.current < playCtx.currentTime) {
-      nextPlaybackTimeRef.current = playCtx.currentTime + 0.05; // 50ms buffer
+      nextPlaybackTimeRef.current = playCtx.currentTime + 0.05;
     }
 
     const buffer = playCtx.createBuffer(1, float32Data.length, 24000);
@@ -279,14 +534,16 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     setIsAiSpeaking(false);
     clearTimeout(speakingTimeoutRef.current);
     if (playbackContextRef.current) {
-      playbackContextRef.current.close().catch(console.error);
+      playbackContextRef.current.close().catch(() => {});
       playbackContextRef.current = null;
     }
     nextPlaybackTimeRef.current = 0;
   };
 
   const toggleMute = () => {
-    setIsMuted(!isMuted);
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
+    isMutedRef.current = nextMuted;
   };
 
   useEffect(() => {
@@ -298,45 +555,71 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   return (
     <Card className="w-full max-w-2xl mx-auto overflow-hidden border-none shadow-2xl bg-stone-50/50 backdrop-blur-sm">
       <CardHeader className="bg-stone-900 text-stone-50 p-6">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
-            <CardTitle className="text-2xl font-serif tracking-tight">Giáo sư Triết học số</CardTitle>
-            <CardDescription className="text-stone-400 font-sans">Trợ giảng AI - Tương tác giọng nói thời gian thực</CardDescription>
+            <div className="flex items-center gap-2">
+              <CardTitle className="text-2xl font-serif tracking-tight">Giáo sư Triết học số</CardTitle>
+              {isConnected && (
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold flex items-center gap-1 ${
+                  engineMode === 'live' ? 'bg-emerald-800/80 text-emerald-200 border border-emerald-600' : 'bg-blue-800/80 text-blue-200 border border-blue-600'
+                }`}>
+                  <Radio className="w-3 h-3 animate-pulse" />
+                  {engineMode === 'live' ? 'Live Audio' : 'Voice Engine'}
+                </span>
+              )}
+            </div>
+            <CardDescription className="text-stone-400 font-sans">Trợ giảng AI - Tương tác giọng nói trực tiếp</CardDescription>
           </div>
           <div className="flex gap-2">
             {!isConnected ? (
               <Button 
-                onClick={startConnection} 
+                onClick={() => startConnection(true)} 
                 disabled={isConnecting}
-                className="bg-red-700 hover:bg-red-800 text-white border-none"
+                className="bg-emerald-700 hover:bg-emerald-800 text-white border-none shadow-md"
               >
                 {isConnecting ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Mic className="w-4 h-4 mr-2" />}
-                Bắt đầu thảo luận
+                Bắt đầu phiên làm việc
               </Button>
             ) : (
               <Button 
                 onClick={stopConnection} 
                 variant="destructive"
-                className="bg-stone-700 hover:bg-stone-800"
+                className="bg-red-800 hover:bg-red-900 shadow-md"
               >
-                Dừng thảo luận
+                Ngắt kết nối
               </Button>
             )}
           </div>
         </div>
       </CardHeader>
-      <CardContent className="p-8 space-y-6">
+
+      <CardContent className="p-6 md:p-8 space-y-6">
         <div className="min-h-[200px] flex flex-col justify-center items-center space-y-6">
           <AnimatePresence mode="wait">
             {error && (
               <motion.div
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
-                className="w-full p-4 bg-red-50 border border-red-100 rounded-xl text-red-700 text-sm text-center mb-4"
+                className="w-full p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-xs flex items-center justify-between gap-2"
               >
-                {error}
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>{error}</span>
+                </div>
+                {!isConnected && (
+                  <Button 
+                    size="sm" 
+                    variant="outline" 
+                    onClick={() => startConnection(false)} 
+                    className="text-xs h-7 bg-white text-stone-800 hover:bg-stone-100 shrink-0"
+                  >
+                    <RefreshCw className="w-3 h-3 mr-1" />
+                    Thử lại
+                  </Button>
+                )}
               </motion.div>
             )}
+
             {!isConnected ? (
               <motion.div 
                 key="idle"
@@ -348,11 +631,27 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                 <div className="flex justify-center mx-auto mb-2">
                   <SchoolLogo className="w-24 h-24 md:w-28 md:h-28" />
                 </div>
-                <div className="space-y-2">
-                  <p className="text-stone-700 font-medium">Nhấn "Bắt đầu" để bật micro và kết nối với Giáo sư.</p>
-                  <p className="text-stone-500 text-xs max-w-md mx-auto">
-                    Cơ chế từ khóa: Bắt đầu câu nói bằng <span className="font-semibold text-red-700 font-mono">"Giáo sư..."</span> để kích hoạt. Nói <span className="font-semibold text-stone-700 font-mono">"Dừng"</span> hoặc <span className="font-semibold text-stone-700 font-mono">"Kết thúc"</span> để quay lại trạng thái chờ.
-                  </p>
+                <div className="space-y-3">
+                  <p className="text-stone-800 font-semibold text-base">Nhấn "Bắt đầu phiên làm việc" để kết nối hệ thống.</p>
+                  
+                  {/* Rule Callout Box */}
+                  <div className="p-3.5 bg-amber-50/80 border border-amber-200/80 rounded-xl text-xs text-amber-950 text-left max-w-lg mx-auto space-y-2">
+                    <div className="flex items-center gap-1.5 font-bold text-amber-900">
+                      <Sparkles className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>Quy tắc vận hành từ khóa:</span>
+                    </div>
+                    <ul className="list-disc pl-4 space-y-1 text-stone-700">
+                      <li>
+                        <span className="font-semibold text-emerald-800">Bắt đầu / Kích hoạt:</span> Gọi <span className="font-bold text-emerald-900 font-mono bg-emerald-100 px-1 py-0.5 rounded">"Giáo sư..."</span> để bắt đầu thảo luận.
+                      </li>
+                      <li>
+                        <span className="font-semibold text-amber-800">Trạng thái chờ (Im lặng tuyệt đối):</span> Giáo sư sẽ <span className="font-bold text-amber-900">tuyệt đối giữ im lặng</span>, không tự ý lên tiếng khi chưa có từ khóa <span className="font-mono">"Giáo sư"</span>.
+                      </li>
+                      <li>
+                        <span className="font-semibold text-red-800">Tạm dừng về chế độ chờ:</span> Nói <span className="font-bold text-red-900 font-mono bg-red-100 px-1 py-0.5 rounded">"Dừng"</span> hoặc <span className="font-bold text-red-900 font-mono bg-red-100 px-1 py-0.5 rounded">"Kết thúc"</span>.
+                      </li>
+                    </ul>
+                  </div>
                 </div>
               </motion.div>
             ) : (
@@ -362,52 +661,62 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                 animate={{ opacity: 1 }}
                 className="w-full space-y-6"
               >
-                {/* Status Indicator Banner */}
-                <div className={`p-4 rounded-xl border text-center transition-all ${
+                {/* Real-time Status Badge & Controls */}
+                <div className={`p-4 rounded-xl border text-center transition-all shadow-sm ${
                   activationState === 'active' 
-                    ? 'bg-emerald-50 border-emerald-200 text-emerald-900' 
-                    : 'bg-amber-50/80 border-amber-200 text-amber-900'
+                    ? 'bg-emerald-50/90 border-emerald-300 text-emerald-950 ring-2 ring-emerald-400/20' 
+                    : 'bg-amber-50/90 border-amber-300 text-amber-950 ring-2 ring-amber-400/20'
                 }`}>
-                  <div className="flex items-center justify-center gap-2 mb-1">
-                    <span className={`w-2.5 h-2.5 rounded-full ${activationState === 'active' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+                  <div className="flex items-center justify-center gap-2 mb-1.5">
+                    <span className={`w-3 h-3 rounded-full ${activationState === 'active' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
                     <span className="font-bold text-xs uppercase tracking-wider">
-                      {activationState === 'active' ? 'Trạng thái: Đã kích hoạt' : 'Trạng thái: Đang chờ từ khóa'}
+                      {activationState === 'active' ? '● TRẠNG THÁI: ĐÃ KÍCH HOẠT (ĐANG LÀM VIỆC)' : '○ TRẠNG THÁI: ĐANG CHỜ TỪ KHÓA (IM LẶNG TUYỆT ĐỐI)'}
                     </span>
                   </div>
-                  <p className="text-xs mb-3">
+                  
+                  <p className="text-xs mb-3 font-medium">
                     {activationState === 'active'
-                      ? 'Đang duy trì hội thoại liên tục. Nói "Kết thúc" hoặc "Dừng" để quay lại trạng thái chờ.'
-                      : 'Bắt đầu câu nói bằng "Giáo sư..." để kích hoạt. Tạp âm và câu nói không gọi Giáo sư sẽ bị bỏ qua.'}
+                      ? 'Giáo sư đang tham gia thảo luận. Nói "Dừng" hoặc "Kết thúc" để quay về trạng thái chờ.'
+                      : 'Giáo sư đang giữ im lặng tuyệt đối. Hãy nói "Giáo sư..." hoặc bấm nút dưới để kích hoạt.'}
                   </p>
-                  <div className="flex justify-center gap-2 pt-1 border-t border-amber-200/60">
+
+                  <div className="flex flex-wrap justify-center gap-2 pt-2 border-t border-stone-200">
                     <Button 
                       size="sm" 
-                      variant="outline"
-                      onClick={() => setActivationState('active')}
-                      className={`text-xs h-7 px-3 ${activationState === 'active' ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700' : 'bg-white border-amber-300 text-amber-900 hover:bg-amber-100'}`}
+                      onClick={() => updateActivationState('active')}
+                      className={`text-xs h-8 px-3.5 font-medium transition-all ${
+                        activationState === 'active' 
+                          ? 'bg-emerald-700 text-white shadow-md' 
+                          : 'bg-white border border-emerald-400 text-emerald-800 hover:bg-emerald-50'
+                      }`}
                     >
-                      Gọi "Giáo sư..." (Kích hoạt)
+                      <Play className="w-3.5 h-3.5 mr-1" />
+                      Kích hoạt: "Giáo sư..."
                     </Button>
                     <Button 
                       size="sm" 
-                      variant="outline"
-                      onClick={() => {
-                        setActivationState('standby');
-                        stopPlayback();
-                      }}
-                      className={`text-xs h-7 px-3 ${activationState === 'standby' ? 'bg-amber-600 text-white border-amber-600 hover:bg-amber-700' : 'bg-white border-amber-300 text-amber-900 hover:bg-amber-100'}`}
+                      onClick={() => updateActivationState('standby')}
+                      className={`text-xs h-8 px-3.5 font-medium transition-all ${
+                        activationState === 'standby' 
+                          ? 'bg-amber-700 text-white shadow-md' 
+                          : 'bg-white border border-amber-400 text-amber-800 hover:bg-amber-50'
+                      }`}
                     >
-                      Nói "Dừng / Kết thúc" (Trạng thái chờ)
+                      <PauseCircle className="w-3.5 h-3.5 mr-1" />
+                      Tạm dừng: "Dừng / Kết thúc"
                     </Button>
                   </div>
                 </div>
 
                 <div className="flex justify-center items-center gap-12 pt-2">
+                  {/* User Mic Visualizer */}
                   <div className="relative text-center">
                     <div className={`w-24 h-24 rounded-full flex items-center justify-center transition-all duration-500 mx-auto ${isMuted ? 'bg-stone-200' : 'bg-red-100'}`}>
                       {isMuted ? <MicOff className="w-10 h-10 text-stone-400" /> : <Mic className="w-10 h-10 text-red-600" />}
                     </div>
-                    <span className="text-xs font-semibold text-stone-500 mt-2 block">Micro người dùng</span>
+                    <span className="text-xs font-semibold text-stone-500 mt-2 block">
+                      {isMuted ? "Micro đã tắt tiếng" : "Micro đang thu"}
+                    </span>
                     {!isMuted && !isAiSpeaking && (
                       <motion.div 
                         animate={{ scale: [1, 1.2, 1], opacity: [0.5, 0.2, 0.5] }}
@@ -417,21 +726,34 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                     )}
                   </div>
 
+                  {/* AI Professor Avatar Visualizer */}
                   <div className="relative text-center flex flex-col items-center">
-                    <div className={`w-28 h-28 rounded-full flex items-center justify-center transition-all duration-500 mx-auto p-1 bg-white shadow-md border-2 ${isAiSpeaking ? 'border-amber-500 ring-4 ring-amber-300/60' : 'border-stone-200'}`}>
+                    <div className={`w-28 h-28 rounded-full flex items-center justify-center transition-all duration-500 mx-auto p-1 bg-white shadow-md border-2 ${
+                      isAiSpeaking 
+                        ? 'border-amber-500 ring-4 ring-amber-300/60' 
+                        : activationState === 'active'
+                          ? 'border-emerald-500 ring-2 ring-emerald-300/40'
+                          : 'border-stone-200 opacity-90'
+                    }`}>
                       <SchoolLogo className="w-full h-full" animated={false} showNameTag={false} />
                     </div>
                     
                     {/* Prominent Name Tag under active avatar */}
                     <div className="mt-2.5 px-3 py-1 bg-[#121E17] border border-[#F9B217] rounded-full shadow-md flex items-center gap-1.5 z-10">
-                      <span className="w-2 h-2 rounded-full bg-[#F9B217] animate-pulse shrink-0" />
+                      <span className={`w-2 h-2 rounded-full ${activationState === 'active' ? 'bg-[#F9B217] animate-pulse' : 'bg-stone-400'} shrink-0`} />
                       <span className="font-serif font-bold text-white tracking-widest text-[11px] md:text-xs">
                         ĐỖ ĐÌNH CƯỜNG
                       </span>
                     </div>
 
                     <span className="text-xs font-semibold text-stone-600 mt-1.5 block">
-                      {isAiSpeaking ? "Giáo sư đang giảng..." : "Giáo sư Triết học số"}
+                      {isAiSpeaking 
+                        ? "Giáo sư đang giảng giải..." 
+                        : isAiThinking
+                          ? "Giáo sư đang suy nghĩ..."
+                          : activationState === 'active'
+                            ? "Giáo sư đang lắng nghe..."
+                            : "Giáo sư (Đang chờ từ khóa)"}
                     </span>
                     {isAiSpeaking && (
                       <motion.div 
@@ -443,17 +765,22 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                   </div>
                 </div>
 
-                <div className="space-y-4 pt-2">
+                {/* Subtitles & Transcriptions */}
+                <div className="space-y-3 pt-2">
                   {transcription && (
-                    <div className="bg-white p-4 rounded-xl border border-stone-100 shadow-sm">
-                      <p className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-1">Bạn đang nói:</p>
-                      <p className="text-stone-700">{transcription}</p>
+                    <div className="bg-white p-3.5 rounded-xl border border-stone-200 shadow-sm">
+                      <p className="text-[11px] font-bold text-stone-400 uppercase tracking-wider mb-1">
+                        Âm thanh nhận diện:
+                      </p>
+                      <p className="text-stone-800 text-sm font-medium">{transcription}</p>
                     </div>
                   )}
-                  {aiTranscription && (
-                    <div className="bg-amber-50/50 p-4 rounded-xl border border-amber-100 shadow-sm">
-                      <p className="text-xs font-bold text-amber-500 uppercase tracking-wider mb-1">Giáo sư:</p>
-                      <p className="text-stone-800 leading-relaxed">{aiTranscription}</p>
+                  {aiTranscription && activationState === 'active' && (
+                    <div className="bg-amber-50/70 p-3.5 rounded-xl border border-amber-200 shadow-sm">
+                      <p className="text-[11px] font-bold text-amber-700 uppercase tracking-wider mb-1">
+                        Giáo sư:
+                      </p>
+                      <p className="text-stone-900 leading-relaxed text-sm">{aiTranscription}</p>
                     </div>
                   )}
                 </div>
@@ -464,6 +791,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                     size="icon" 
                     onClick={toggleMute}
                     className={`rounded-full w-12 h-12 ${isMuted ? 'bg-red-50 text-red-600 border-red-200' : 'text-stone-600'}`}
+                    title={isMuted ? "Bật micro" : "Tắt tiếng micro"}
                   >
                     {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
                   </Button>
