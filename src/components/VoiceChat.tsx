@@ -1,14 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
-import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Mic, MicOff, Loader2, Play, PauseCircle, Sparkles, RefreshCw, Radio, CheckCircle2 } from "lucide-react";
 import { arrayBufferToBase64, base64ToArrayBuffer, float32ToInt16, int16ToFloat32 } from "@/src/lib/audio-utils";
 import { motion, AnimatePresence } from "motion/react";
 import SchoolLogo from './SchoolLogo';
-
-const LIVE_MODEL_NAME = "gemini-3.1-flash-live-preview";
-const FALLBACK_MODEL_NAME = "gemini-3.7-flash";
 
 const WORKLET_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
@@ -57,8 +53,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   const isMutedRef = useRef(false);
   const engineModeRef = useRef<'live' | 'standard'>('live');
 
-  const aiRef = useRef<any>(null);
-  const sessionRef = useRef<any>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
@@ -145,23 +140,27 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
 
   // Process user speech when using Fallback Standard Engine with Real-Time Google Search Grounding
   const processFallbackTurn = async (userPrompt: string) => {
-    if (isProcessingFallbackRef.current || !aiRef.current || isMutedRef.current) return;
+    if (isProcessingFallbackRef.current || isMutedRef.current) return;
     isProcessingFallbackRef.current = true;
     setIsAiThinking(true);
 
     try {
-      const response = await aiRef.current.models.generateContent({
-        model: FALLBACK_MODEL_NAME,
-        contents: [
-          { role: 'user', parts: [{ text: userPrompt }] }
-        ],
-        config: {
+      const response = await fetch('/api/gemini/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: userPrompt,
           systemInstruction,
-          tools: [{ googleSearch: {} }],
-        }
+        }),
       });
 
-      const replyText = response.text || "";
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Server responded with ${response.status}`);
+      }
+
+      const data = await response.json();
+      const replyText = data.text || "";
       if (replyText) {
         setAiTranscription(replyText);
         
@@ -291,83 +290,83 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-      aiRef.current = ai;
-
       if (!preferLive) {
         startFallbackConnection();
         return;
       }
 
-      // Connect to Live API
+      // Connect to Live API via server WebSocket
       let hasOpened = false;
-      const sessionPromise = ai.live.connect({
-        model: LIVE_MODEL_NAME,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
-          },
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/api/live`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({
+          type: 'init',
           systemInstruction,
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        },
-        callbacks: {
-          onopen: () => {
-            console.log("Live API connected");
+          voiceName: 'Zephyr',
+        }));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.type === 'open') {
+            console.log("Live API connected via server");
             hasOpened = true;
             setEngineMode('live');
             engineModeRef.current = 'live';
             setIsConnected(true);
             isSessionActiveRef.current = true;
             setIsConnecting(false);
-            
-            sessionPromise.then(session => {
-              sessionRef.current = session;
-              startMic(session);
-              startSpeechRecognition();
-            });
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            const inputTranscription = (message as any).serverContent?.inputAudioTranscription?.transcription;
-            if (inputTranscription) {
-              setTranscription(inputTranscription);
-              if (isWakeWord(inputTranscription)) {
+
+            startMic(ws);
+            startSpeechRecognition();
+            return;
+          }
+
+          if (data.type === 'message') {
+            if (data.inputTranscription) {
+              setTranscription(data.inputTranscription);
+              if (isWakeWord(data.inputTranscription)) {
                 updateActivationState('active');
-              } else if (isStopWord(inputTranscription)) {
+              } else if (isStopWord(data.inputTranscription)) {
                 updateActivationState('standby');
               }
             }
 
-            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
+            if (data.audio) {
               if (activationStateRef.current === 'active') {
-                const audioData = base64ToArrayBuffer(base64Audio);
+                const audioData = base64ToArrayBuffer(data.audio);
                 const float32Data = int16ToFloat32(new Int16Array(audioData));
                 scheduleAudio(float32Data);
               }
             }
 
-            const outputTranscription = (message as any).serverContent?.modelTurn?.parts?.find((p: any) => p.text)?.text;
-            if (outputTranscription) {
-              setAiTranscription(prev => prev ? prev + " " + outputTranscription : outputTranscription);
-              if (outputTranscription.toLowerCase().includes("trạng thái chờ") || outputTranscription.toLowerCase().includes("chế độ chờ")) {
+            if (data.outputTranscription) {
+              setAiTranscription(prev => prev ? prev + " " + data.outputTranscription : data.outputTranscription);
+              if (data.outputTranscription.toLowerCase().includes("trạng thái chờ") || data.outputTranscription.toLowerCase().includes("chế độ chờ")) {
                 setTimeout(() => {
                   updateActivationState('standby');
                 }, 2500);
               }
             }
 
-            if (message.serverContent?.interrupted) {
+            if (data.interrupted) {
               stopPlayback();
             }
-          },
-          onerror: (error: any) => {
-            console.warn("Live API encounter:", error);
-            const errStr = String(error?.message || error || "");
+            return;
+          }
+
+          if (data.type === 'error') {
+            console.warn("Live API encounter:", data.error);
+            const errStr = String(data.error || "");
             
             // If service unavailable or transient error, automatically switch to reliable fallback engine!
-            if (!hasOpened || errStr.includes("unavailable") || errStr.includes("Network") || errStr.includes("503")) {
+            if (!hasOpened || errStr.includes("unavailable") || errStr.includes("Network") || errStr.includes("503") || errStr.includes("not found")) {
               console.log("Switching to Standard Gemini AI Engine due to Live API temporary unavailability...");
               setError("Live Audio máy chủ đang bảo trì/quá tải. Đã chuyển sang Chế độ Giọng nói Dự phòng độ ổn định cao.");
               startFallbackConnection();
@@ -378,15 +377,34 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                 startConnection(false);
               }, 2000);
             }
-          },
-          onclose: () => {
+            return;
+          }
+
+          if (data.type === 'close') {
             console.log("Live API closed");
             if (isSessionActiveRef.current && engineModeRef.current === 'live') {
               startFallbackConnection();
             }
-          },
-        },
-      });
+            return;
+          }
+        } catch (e) {
+          console.error("Error parsing Live message:", e);
+        }
+      };
+
+      ws.onerror = (e) => {
+        console.warn("Live API websocket error:", e);
+        if (!hasOpened) {
+          startFallbackConnection();
+        }
+      };
+
+      ws.onclose = () => {
+        console.log("Live API websocket closed");
+        if (isSessionActiveRef.current && engineModeRef.current === 'live') {
+          startFallbackConnection();
+        }
+      };
 
       // Timeout safeguard in case websocket stalls
       setTimeout(() => {
@@ -412,11 +430,14 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     isSessionActiveRef.current = false;
     clearTimeout(reconnectTimeoutRef.current);
     stopSpeechRecognition();
-    if (sessionRef.current) {
+    if (wsRef.current) {
       try {
-        sessionRef.current.close();
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'close' }));
+        }
+        wsRef.current.close();
       } catch (e) {}
-      sessionRef.current = null;
+      wsRef.current = null;
     }
     stopMic();
     stopPlayback();
@@ -431,7 +452,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     setIsAiThinking(false);
   };
 
-  const startMic = async (session: any) => {
+  const startMic = async (ws: WebSocket) => {
     try {
       let stream = streamRef.current;
       if (!stream) {
@@ -451,22 +472,17 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       workletNodeRef.current = workletNode;
 
       workletNode.port.onmessage = (e) => {
-        if (isMutedRef.current || !isSessionActiveRef.current || session !== sessionRef.current) return;
+        if (isMutedRef.current || !isSessionActiveRef.current || ws !== wsRef.current || ws.readyState !== WebSocket.OPEN) return;
 
         const inputData = e.data;
         const int16Data = float32ToInt16(inputData);
         const base64Data = arrayBufferToBase64(int16Data.buffer);
 
         try {
-          const result = session.sendRealtimeInput({
-            audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
-          });
-          
-          if (result instanceof Promise) {
-            result.catch(() => {
-              // Ignore non-fatal frame drops
-            });
-          }
+          ws.send(JSON.stringify({
+            type: 'realtime_input',
+            audio: base64Data,
+          }));
         } catch (err) {
           // Handled gracefully
         }
