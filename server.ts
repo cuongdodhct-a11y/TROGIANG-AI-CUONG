@@ -3,7 +3,13 @@ import express from 'express';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
+import {
+  GoogleGenAI,
+  Modality,
+  LiveServerMessage,
+  ActivityHandling,
+  EndSensitivity,
+} from '@google/genai';
 import { WebSocketServer, WebSocket } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -29,19 +35,26 @@ const ai = new GoogleGenAI({
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// Unary generateContent endpoint with Google Search grounding
+// Unary generateContent endpoint with Google Search grounding & multi-turn support
 app.post('/api/gemini/generate', async (req, res) => {
   try {
-    const { prompt, systemInstruction } = req.body;
+    const { prompt, systemInstruction, history } = req.body;
     if (!prompt) {
       return res.status(400).json({ error: 'Missing prompt parameter' });
     }
 
+    const contents = Array.isArray(history) && history.length > 0
+      ? [
+          ...history,
+          { role: 'user', parts: [{ text: prompt }] },
+        ]
+      : [
+          { role: 'user', parts: [{ text: prompt }] },
+        ];
+
     const response = await ai.models.generateContent({
       model: 'gemini-3.8-flash',
-      contents: [
-        { role: 'user', parts: [{ text: prompt }] },
-      ],
+      contents,
       config: {
         systemInstruction: systemInstruction || undefined,
         tools: [{ googleSearch: {} }],
@@ -60,7 +73,7 @@ app.post('/api/gemini/generate', async (req, res) => {
 // Streaming generateContent endpoint via SSE
 app.post('/api/gemini/stream', async (req, res) => {
   try {
-    const { prompt, systemInstruction } = req.body;
+    const { prompt, systemInstruction, history } = req.body;
     if (!prompt) {
       return res.status(400).json({ error: 'Missing prompt parameter' });
     }
@@ -72,11 +85,18 @@ app.post('/api/gemini/stream', async (req, res) => {
       (res as any).flushHeaders();
     }
 
+    const contents = Array.isArray(history) && history.length > 0
+      ? [
+          ...history,
+          { role: 'user', parts: [{ text: prompt }] },
+        ]
+      : [
+          { role: 'user', parts: [{ text: prompt }] },
+        ];
+
     const responseStream = await ai.models.generateContentStream({
       model: 'gemini-3.8-flash',
-      contents: [
-        { role: 'user', parts: [{ text: prompt }] },
-      ],
+      contents,
       config: {
         systemInstruction: systemInstruction || undefined,
         tools: [{ googleSearch: {} }],
@@ -111,6 +131,7 @@ const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', (clientWs: WebSocket) => {
   let liveSession: any = null;
   let isClosed = false;
+  let isModelGenerating = false;
 
   clientWs.on('message', async (data) => {
     try {
@@ -130,6 +151,16 @@ wss.on('connection', (clientWs: WebSocket) => {
               systemInstruction: systemInstruction || undefined,
               inputAudioTranscription: {},
               outputAudioTranscription: {},
+              contextWindowCompression: {
+                slidingWindow: {},
+              },
+              realtimeInputConfig: {
+                activityHandling: ActivityHandling.NO_INTERRUPTION,
+                automaticActivityDetection: {
+                  endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+                  silenceDurationMs: 1000,
+                },
+              },
             },
             callbacks: {
               onopen: () => {
@@ -140,21 +171,64 @@ wss.on('connection', (clientWs: WebSocket) => {
               onmessage: (message: LiveServerMessage) => {
                 if (clientWs.readyState !== WebSocket.OPEN) return;
 
-                const inputTranscription = (message as any).serverContent?.inputAudioTranscription?.transcription;
-                const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-                const outputTranscription = message.serverContent?.modelTurn?.parts?.find((p: any) => p.text)?.text;
-                const interrupted = !!message.serverContent?.interrupted;
+                const serverContent = message.serverContent as any;
+                const inputTranscription =
+                  serverContent?.inputTranscription?.text ||
+                  serverContent?.inputAudioTranscription?.transcription;
 
-                clientWs.send(JSON.stringify({
-                  type: 'message',
-                  inputTranscription,
-                  audio,
-                  outputTranscription,
-                  interrupted,
-                }));
+                const parts: any[] = serverContent?.modelTurn?.parts || [];
+                const audioChunks: string[] = [];
+                let textParts = '';
+
+                for (const part of parts) {
+                  if (part?.inlineData?.data) {
+                    audioChunks.push(part.inlineData.data);
+                  }
+                  if (part?.text && !part?.thought) {
+                    textParts += (textParts ? ' ' : '') + part.text;
+                  }
+                }
+
+                const outputTranscription =
+                  serverContent?.outputTranscription?.text ||
+                  serverContent?.outputAudioTranscription?.transcription ||
+                  textParts ||
+                  undefined;
+
+                const turnComplete = !!serverContent?.turnComplete;
+                const interrupted = !!serverContent?.interrupted;
+
+                if (audioChunks.length > 0 || outputTranscription) {
+                  isModelGenerating = true;
+                }
+                if (turnComplete || interrupted) {
+                  isModelGenerating = false;
+                }
+
+                if (audioChunks.length > 0) {
+                  audioChunks.forEach((audio, idx) => {
+                    clientWs.send(JSON.stringify({
+                      type: 'message',
+                      inputTranscription: idx === 0 ? inputTranscription : undefined,
+                      audio,
+                      outputTranscription: idx === 0 ? outputTranscription : undefined,
+                      turnComplete: idx === audioChunks.length - 1 ? turnComplete : false,
+                      interrupted: false,
+                    }));
+                  });
+                } else if (inputTranscription || outputTranscription || turnComplete || interrupted) {
+                  clientWs.send(JSON.stringify({
+                    type: 'message',
+                    inputTranscription,
+                    outputTranscription,
+                    turnComplete,
+                    interrupted: false,
+                  }));
+                }
               },
               onerror: (error: any) => {
                 console.warn('[Gemini Live Session Error]:', error);
+                isModelGenerating = false;
                 if (clientWs.readyState === WebSocket.OPEN) {
                   clientWs.send(JSON.stringify({
                     type: 'error',
@@ -163,6 +237,7 @@ wss.on('connection', (clientWs: WebSocket) => {
                 }
               },
               onclose: () => {
+                isModelGenerating = false;
                 if (clientWs.readyState === WebSocket.OPEN) {
                   clientWs.send(JSON.stringify({ type: 'close' }));
                 }
@@ -182,6 +257,8 @@ wss.on('connection', (clientWs: WebSocket) => {
       }
 
       if (msg.type === 'realtime_input' || msg.audio) {
+        // Suppress mic input while the model is actively generating a turn to prevent echo self-interruption
+        if (isModelGenerating) return;
         const audioBase64 = msg.audio || msg.data;
         if (liveSession && audioBase64) {
           liveSession.sendRealtimeInput({
@@ -202,6 +279,7 @@ wss.on('connection', (clientWs: WebSocket) => {
       }
 
       if (msg.type === 'close') {
+        isModelGenerating = false;
         if (liveSession) {
           try {
             liveSession.close();
@@ -218,6 +296,7 @@ wss.on('connection', (clientWs: WebSocket) => {
   const cleanup = () => {
     if (isClosed) return;
     isClosed = true;
+    isModelGenerating = false;
     if (liveSession) {
       try {
         liveSession.close();

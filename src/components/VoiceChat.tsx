@@ -52,27 +52,59 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   const activationStateRef = useRef<'standby' | 'active'>('standby');
   const isMutedRef = useRef(false);
   const engineModeRef = useRef<'live' | 'standard'>('live');
+  const isAiSpeakingRef = useRef(false);
+  const postSpeechCooldownUntilRef = useRef(0);
+  const isLiveTurnStreamingRef = useRef(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextPlaybackTimeRef = useRef(0);
   const speakingTimeoutRef = useRef<any>(null);
   const isSessionActiveRef = useRef(false);
   const speechRecognizerRef = useRef<any>(null);
   const isProcessingFallbackRef = useRef(false);
   const reconnectTimeoutRef = useRef<any>(null);
+  const fallbackDebounceTimeoutRef = useRef<any>(null);
+  const pendingFallbackTranscriptRef = useRef<string>("");
+  const chatHistoryRef = useRef<Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }>>([]);
+
+  // Refs for chunked SpeechSynthesis so Chrome never garbage-collects or cuts off after 15 seconds
+  const ttsQueueRef = useRef<string[]>([]);
+  const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const ttsKeepAliveIntervalRef = useRef<any>(null);
+  const isTtsCancelledRef = useRef(false);
+
+  const setAiSpeakingState = (speaking: boolean) => {
+    if (isAiSpeakingRef.current && !speaking) {
+      postSpeechCooldownUntilRef.current = Date.now() + 650;
+    }
+    isAiSpeakingRef.current = speaking;
+    setIsAiSpeaking(speaking);
+  };
+
+  const stopTtsQueue = () => {
+    isTtsCancelledRef.current = true;
+    ttsQueueRef.current = [];
+    currentUtteranceRef.current = null;
+    if (ttsKeepAliveIntervalRef.current) {
+      clearInterval(ttsKeepAliveIntervalRef.current);
+      ttsKeepAliveIntervalRef.current = null;
+    }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+  };
 
   const updateActivationState = (newState: 'standby' | 'active') => {
     activationStateRef.current = newState;
     setActivationState(newState);
     if (newState === 'standby') {
       stopPlayback();
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-      }
+      stopTtsQueue();
     }
   };
 
@@ -89,32 +121,122 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     );
   };
 
+  // Strict stop command detection: avoids false positives on words like "nội dung", "vận dụng", "không dừng lại ở đó", "kết thúc giai đoạn"
   const isStopWord = (text: string): boolean => {
-    const t = text.toLowerCase().trim();
-    return (
-      t.includes("kết thúc") ||
-      t.includes("ket thuc") ||
-      t.includes("dừng lại") ||
-      t.includes("dung lai") ||
-      t.includes("dừng") ||
-      t.includes("dung") ||
-      t.includes("tạm dừng") ||
-      t.includes("tam dung") ||
-      t.includes("ngắt lời") ||
-      t.includes("ngắt") ||
-      t.includes("về chế độ chờ") ||
-      t.includes("stop")
+    const t = text
+      .toLowerCase()
+      .replace(/[.,!?;:"'()[\]]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!t) return false;
+    const words = t.split(' ');
+    // A genuine stop command is a brief directive, not a long sentence or philosophical question
+    if (words.length > 7) return false;
+
+    const exactCommands = [
+      "dừng",
+      "dừng lại",
+      "tạm dừng",
+      "kết thúc",
+      "ngắt lời",
+      "về chế độ chờ",
+      "về trạng thái chờ",
+      "chuyển về trạng thái chờ",
+      "chuyển về chế độ chờ",
+      "giáo sư dừng",
+      "giáo sư dừng lại",
+      "giáo sư tạm dừng",
+      "giáo sư kết thúc",
+      "thưa giáo sư dừng lại",
+      "thôi dừng",
+      "thôi dừng lại",
+      "stop",
+    ];
+
+    return exactCommands.some(
+      cmd => t === cmd || t.startsWith(cmd + " ") || t.endsWith(" " + cmd)
     );
   };
 
-  // Speaks text using browser SpeechSynthesis with Vietnamese voice
-  const speakText = (text: string) => {
-    if (!('speechSynthesis' in window) || activationStateRef.current !== 'active') return;
+  const cleanTextForSpeech = (raw: string): string => {
+    return raw
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/^#+\s+/gm, '')
+      .replace(/^\s*[-*•]\s+/gm, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
 
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
+  const splitIntoSpeechChunks = (text: string, maxLen = 155): string[] => {
+    const cleaned = cleanTextForSpeech(text);
+    if (!cleaned) return [];
+
+    // Split by sentence-ending punctuation first
+    const rawSentences = cleaned.split(/(?<=[.!?…;:\n])\s+/);
+    const chunks: string[] = [];
+
+    for (const sentence of rawSentences) {
+      const s = sentence.trim();
+      if (!s) continue;
+      if (s.length <= maxLen) {
+        chunks.push(s);
+      } else {
+        // Split long sentences by commas or clauses so no chunk exceeds Chrome's 15s TTS limit
+        const subParts = s.split(/(?<=[,，–—])\s+/);
+        let current = "";
+        for (const part of subParts) {
+          if (!current) {
+            current = part;
+          } else if ((current + " " + part).length <= maxLen) {
+            current += " " + part;
+          } else {
+            chunks.push(current.trim());
+            current = part;
+          }
+        }
+        if (current.trim()) {
+          // If still very long without commas, split by word boundaries
+          let rem = current.trim();
+          while (rem.length > maxLen) {
+            let splitIdx = rem.lastIndexOf(' ', maxLen);
+            if (splitIdx <= 0) splitIdx = maxLen;
+            chunks.push(rem.slice(0, splitIdx).trim());
+            rem = rem.slice(splitIdx).trim();
+          }
+          if (rem) chunks.push(rem);
+        }
+      }
+    }
+
+    return chunks;
+  };
+
+  const playNextTtsChunk = () => {
+    if (isTtsCancelledRef.current || activationStateRef.current !== 'active') {
+      setAiSpeakingState(false);
+      return;
+    }
+
+    const nextChunk = ttsQueueRef.current.shift();
+    if (!nextChunk) {
+      currentUtteranceRef.current = null;
+      if (ttsKeepAliveIntervalRef.current) {
+        clearInterval(ttsKeepAliveIntervalRef.current);
+        ttsKeepAliveIntervalRef.current = null;
+      }
+      setAiSpeakingState(false);
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(nextChunk);
+    currentUtteranceRef.current = utterance;
     utterance.lang = 'vi-VN';
-    utterance.rate = 0.95;
+    utterance.rate = 0.96;
     utterance.pitch = 0.95;
 
     const voices = window.speechSynthesis.getVoices();
@@ -124,56 +246,187 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     }
 
     utterance.onstart = () => {
-      setIsAiSpeaking(true);
+      if (!isTtsCancelledRef.current) {
+        setAiSpeakingState(true);
+      }
     };
 
     utterance.onend = () => {
-      setIsAiSpeaking(false);
+      if (!isTtsCancelledRef.current) {
+        playNextTtsChunk();
+      }
     };
 
-    utterance.onerror = () => {
-      setIsAiSpeaking(false);
+    utterance.onerror = (e: any) => {
+      // Ignore 'interrupted' or 'canceled' when intentionally stopped, otherwise continue with remaining chunks
+      if (!isTtsCancelledRef.current && e?.error !== 'canceled' && e?.error !== 'interrupted') {
+        playNextTtsChunk();
+      }
     };
 
     window.speechSynthesis.speak(utterance);
   };
 
-  // Process user speech when using Fallback Standard Engine with Real-Time Google Search Grounding
+  // Speaks full text reliably using chunked queue to prevent Chrome's 15-second cutoff & GC bug
+  const speakText = (text: string, append = false) => {
+    if (!('speechSynthesis' in window) || activationStateRef.current !== 'active') return;
+
+    const newChunks = splitIntoSpeechChunks(text);
+    if (newChunks.length === 0) return;
+
+    if (!append) {
+      stopTtsQueue();
+      isTtsCancelledRef.current = false;
+      ttsQueueRef.current = newChunks;
+    } else {
+      isTtsCancelledRef.current = false;
+      ttsQueueRef.current.push(...newChunks);
+    }
+
+    // Start Chrome speechSynthesis keep-alive watchdog
+    if (!ttsKeepAliveIntervalRef.current) {
+      ttsKeepAliveIntervalRef.current = setInterval(() => {
+        if ('speechSynthesis' in window && window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+          window.speechSynthesis.pause();
+          window.speechSynthesis.resume();
+        } else if ('speechSynthesis' in window && window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
+      }, 5000);
+    }
+
+    if (!currentUtteranceRef.current && !window.speechSynthesis.speaking) {
+      setAiSpeakingState(true);
+      playNextTtsChunk();
+    }
+  };
+
+  // Process user speech when using Fallback Standard Engine with Streaming + Real-Time Google Search Grounding
   const processFallbackTurn = async (userPrompt: string) => {
-    if (isProcessingFallbackRef.current || isMutedRef.current) return;
+    if (isProcessingFallbackRef.current || isMutedRef.current || isAiSpeakingRef.current) return;
     isProcessingFallbackRef.current = true;
     setIsAiThinking(true);
+    setAiTranscription("");
 
     try {
-      const response = await fetch('/api/gemini/generate', {
+      const response = await fetch('/api/gemini/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt: userPrompt,
           systemInstruction,
+          history: chatHistoryRef.current.slice(-10),
         }),
       });
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.error || `Server responded with ${response.status}`);
+      if (!response.ok || !response.body) {
+        // Fallback to unary endpoint if streaming response unavailable
+        const unaryRes = await fetch('/api/gemini/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: userPrompt,
+            systemInstruction,
+            history: chatHistoryRef.current.slice(-10),
+          }),
+        });
+        if (!unaryRes.ok) {
+          const errData = await unaryRes.json().catch(() => ({}));
+          throw new Error(errData.error || `Server responded with ${unaryRes.status}`);
+        }
+        const data = await unaryRes.json();
+        const replyText = data.text || "";
+        if (replyText) {
+          setAiTranscription(replyText);
+          chatHistoryRef.current.push(
+            { role: 'user', parts: [{ text: userPrompt }] },
+            { role: 'model', parts: [{ text: replyText }] }
+          );
+          if (activationStateRef.current === 'active') {
+            speakText(replyText, false);
+          }
+        }
+        return;
       }
 
-      const data = await response.json();
-      const replyText = data.text || "";
-      if (replyText) {
-        setAiTranscription(replyText);
-        
-        // If activated, speak out the answer
-        if (activationStateRef.current === 'active') {
-          speakText(replyText);
-        }
+      stopTtsQueue();
+      isTtsCancelledRef.current = false;
 
-        // Check if reply instructs return to standby
-        if (replyText.toLowerCase().includes("trạng thái chờ") || replyText.toLowerCase().includes("chế độ chờ")) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let sseBuffer = "";
+      let fullReply = "";
+      let sentenceBuffer = "";
+      let hasStartedSpeaking = false;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        sseBuffer += decoder.decode(value, { stream: true });
+        const lines = sseBuffer.split('\n');
+        sseBuffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine.startsWith('data:')) continue;
+          const payload = trimmedLine.slice(5).trim();
+          if (payload === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(payload);
+            if (parsed.error) {
+              throw new Error(parsed.error);
+            }
+            if (parsed.text) {
+              fullReply += parsed.text;
+              sentenceBuffer += parsed.text;
+              setAiTranscription(fullReply);
+              setIsAiThinking(false);
+
+              // Speak completed sentences progressively so user hears smooth, uninterrupted speech
+              const lastPunctIdx = Math.max(
+                sentenceBuffer.lastIndexOf('. '),
+                sentenceBuffer.lastIndexOf('! '),
+                sentenceBuffer.lastIndexOf('? '),
+                sentenceBuffer.lastIndexOf(';\n'),
+                sentenceBuffer.lastIndexOf('.\n'),
+                sentenceBuffer.lastIndexOf('\n\n')
+              );
+
+              if (lastPunctIdx !== -1 && sentenceBuffer.length >= 60) {
+                const readyToSpeak = sentenceBuffer.slice(0, lastPunctIdx + 1);
+                sentenceBuffer = sentenceBuffer.slice(lastPunctIdx + 1);
+                if (activationStateRef.current === 'active') {
+                  speakText(readyToSpeak, hasStartedSpeaking);
+                  hasStartedSpeaking = true;
+                }
+              }
+            }
+          } catch (e) {
+            // Ignore partial JSON parse errors
+          }
+        }
+      }
+
+      if (sentenceBuffer.trim() && activationStateRef.current === 'active') {
+        speakText(sentenceBuffer.trim(), hasStartedSpeaking);
+      }
+
+      if (fullReply) {
+        chatHistoryRef.current.push(
+          { role: 'user', parts: [{ text: userPrompt }] },
+          { role: 'model', parts: [{ text: fullReply }] }
+        );
+
+        const lowerReply = fullReply.toLowerCase();
+        if (
+          (lowerReply.includes("chuyển về trạng thái chờ") || lowerReply.includes("quay lại trạng thái chờ")) &&
+          fullReply.length < 160
+        ) {
           setTimeout(() => {
             updateActivationState('standby');
-          }, 3000);
+          }, 3500);
         }
       }
     } catch (err: any) {
@@ -200,6 +453,12 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       recognizer.lang = 'vi-VN';
 
       recognizer.onresult = (event: any) => {
+        // Ignore microphone speech recognition while AI is speaking (or in post-speech echo cooldown)
+        // so the Professor's own voice from speakers never interrupts or re-triggers her
+        if (isAiSpeakingRef.current || Date.now() < postSpeechCooldownUntilRef.current) {
+          return;
+        }
+
         let currentTranscript = "";
         let isFinal = false;
 
@@ -220,15 +479,22 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
           } else if (isStopWord(trimmed)) {
             console.log("Keyword detected: Dừng/Kết thúc -> STANDBY");
             updateActivationState('standby');
-            if ('speechSynthesis' in window) {
-              window.speechSynthesis.cancel();
-            }
             return;
           }
 
-          // If in standard fallback mode and user finished speaking while active, send to Gemini
-          if (engineModeRef.current === 'standard' && isFinal && activationStateRef.current === 'active') {
-            processFallbackTurn(trimmed);
+          // If in standard fallback mode and user finished speaking while active, debounce slightly so brief pauses don't cut off user's question
+          if (engineModeRef.current === 'standard' && activationStateRef.current === 'active') {
+            pendingFallbackTranscriptRef.current = trimmed;
+            clearTimeout(fallbackDebounceTimeoutRef.current);
+            if (isFinal) {
+              fallbackDebounceTimeoutRef.current = setTimeout(() => {
+                const finalPrompt = pendingFallbackTranscriptRef.current.trim();
+                pendingFallbackTranscriptRef.current = "";
+                if (finalPrompt && activationStateRef.current === 'active' && !isAiSpeakingRef.current) {
+                  processFallbackTurn(finalPrompt);
+                }
+              }, 650);
+            }
           }
         }
       };
@@ -255,6 +521,8 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   };
 
   const stopSpeechRecognition = () => {
+    clearTimeout(fallbackDebounceTimeoutRef.current);
+    pendingFallbackTranscriptRef.current = "";
     if (speechRecognizerRef.current) {
       try {
         speechRecognizerRef.current.abort();
@@ -287,7 +555,13 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     updateActivationState('standby');
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       streamRef.current = stream;
 
       if (!preferLive) {
@@ -329,34 +603,35 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
           }
 
           if (data.type === 'message') {
-            if (data.inputTranscription) {
+            if (data.inputTranscription && !isAiSpeakingRef.current) {
               setTranscription(data.inputTranscription);
               if (isWakeWord(data.inputTranscription)) {
                 updateActivationState('active');
               } else if (isStopWord(data.inputTranscription)) {
                 updateActivationState('standby');
+                return;
               }
             }
 
             if (data.audio) {
               if (activationStateRef.current === 'active') {
+                if (!isLiveTurnStreamingRef.current) {
+                  isLiveTurnStreamingRef.current = true;
+                  setAiTranscription("");
+                }
                 const audioData = base64ToArrayBuffer(data.audio);
                 const float32Data = int16ToFloat32(new Int16Array(audioData));
                 scheduleAudio(float32Data);
               }
             }
 
-            if (data.outputTranscription) {
+            if (data.outputTranscription && activationStateRef.current === 'active') {
               setAiTranscription(prev => prev ? prev + " " + data.outputTranscription : data.outputTranscription);
-              if (data.outputTranscription.toLowerCase().includes("trạng thái chờ") || data.outputTranscription.toLowerCase().includes("chế độ chờ")) {
-                setTimeout(() => {
-                  updateActivationState('standby');
-                }, 2500);
-              }
             }
 
-            if (data.interrupted) {
-              stopPlayback();
+            if (data.turnComplete) {
+              isLiveTurnStreamingRef.current = false;
+              scheduleSpeakingEndCheck();
             }
             return;
           }
@@ -428,6 +703,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
 
   const stopConnection = () => {
     isSessionActiveRef.current = false;
+    isLiveTurnStreamingRef.current = false;
     clearTimeout(reconnectTimeoutRef.current);
     stopSpeechRecognition();
     if (wsRef.current) {
@@ -441,9 +717,8 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     }
     stopMic();
     stopPlayback();
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
+    stopTtsQueue();
+    chatHistoryRef.current = [];
     setIsConnected(false);
     setIsConnecting(false);
     updateActivationState('standby');
@@ -456,7 +731,13 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     try {
       let stream = streamRef.current;
       if (!stream) {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
         streamRef.current = stream;
       }
 
@@ -472,7 +753,24 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       workletNodeRef.current = workletNode;
 
       workletNode.port.onmessage = (e) => {
-        if (isMutedRef.current || !isSessionActiveRef.current || ws !== wsRef.current || ws.readyState !== WebSocket.OPEN) return;
+        if (
+          isMutedRef.current ||
+          !isSessionActiveRef.current ||
+          ws !== wsRef.current ||
+          ws.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+
+        // Gate mic transmission while the Professor is speaking (and during post-speech echo decay)
+        // so loudspeaker output never loops back into Live API to cut off the explanation
+        if (
+          isAiSpeakingRef.current ||
+          isLiveTurnStreamingRef.current ||
+          Date.now() < postSpeechCooldownUntilRef.current
+        ) {
+          return;
+        }
 
         const inputData = e.data;
         const int16Data = float32ToInt16(inputData);
@@ -510,6 +808,28 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     }
   };
 
+  const scheduleSpeakingEndCheck = () => {
+    clearTimeout(speakingTimeoutRef.current);
+    const playCtx = playbackContextRef.current;
+    if (!playCtx) {
+      if (!isLiveTurnStreamingRef.current) {
+        setAiSpeakingState(false);
+      }
+      return;
+    }
+
+    const remainingMs = Math.max(0, (nextPlaybackTimeRef.current - playCtx.currentTime) * 1000);
+    speakingTimeoutRef.current = setTimeout(() => {
+      const ctx = playbackContextRef.current;
+      const stillPlaying = ctx && nextPlaybackTimeRef.current > ctx.currentTime + 0.05;
+      if (stillPlaying || isLiveTurnStreamingRef.current) {
+        scheduleSpeakingEndCheck();
+      } else {
+        setAiSpeakingState(false);
+      }
+    }, remainingMs + 150);
+  };
+
   const scheduleAudio = (float32Data: Float32Array) => {
     if (activationStateRef.current !== 'active') return;
 
@@ -533,22 +853,31 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     const source = playCtx.createBufferSource();
     source.buffer = buffer;
     source.connect(playCtx.destination);
+
+    // Keep reference to prevent premature browser garbage collection of scheduled audio chunks
+    activeSourcesRef.current.add(source);
+    source.onended = () => {
+      activeSourcesRef.current.delete(source);
+    };
+
     source.start(nextPlaybackTimeRef.current);
-    
     nextPlaybackTimeRef.current += buffer.duration;
     
-    setIsAiSpeaking(true);
-    
-    clearTimeout(speakingTimeoutRef.current);
-    const delay = (nextPlaybackTimeRef.current - playCtx.currentTime) * 1000;
-    speakingTimeoutRef.current = setTimeout(() => {
-      setIsAiSpeaking(false);
-    }, delay);
+    setAiSpeakingState(true);
+    scheduleSpeakingEndCheck();
   };
 
   const stopPlayback = () => {
-    setIsAiSpeaking(false);
+    isLiveTurnStreamingRef.current = false;
+    setAiSpeakingState(false);
     clearTimeout(speakingTimeoutRef.current);
+    activeSourcesRef.current.forEach(src => {
+      try {
+        src.stop();
+        src.disconnect();
+      } catch (e) {}
+    });
+    activeSourcesRef.current.clear();
     if (playbackContextRef.current) {
       playbackContextRef.current.close().catch(() => {});
       playbackContextRef.current = null;
