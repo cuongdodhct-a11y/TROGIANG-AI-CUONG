@@ -21,12 +21,17 @@ export function getGeminiClient(): GoogleGenAI {
 }
 
 export function checkRequest(req: any, res: any): boolean {
-  const ipHeader = req.headers?.["x-forwarded-for"];
-  const ip = (Array.isArray(ipHeader) ? ipHeader[0] : String(ipHeader || "unknown"))
+  const ip = String(req.ip || req.headers?.["x-vercel-forwarded-for"] || "unknown")
     .split(",")[0].trim().slice(0, 80);
   const now = Date.now();
   const current = requestWindows.get(ip);
   if (!current || now >= current.resetAt) {
+    if (requestWindows.size > 5000) {
+      for (const [key, value] of requestWindows) {
+        if (now >= value.resetAt) requestWindows.delete(key);
+      }
+      if (requestWindows.size > 5000) requestWindows.clear();
+    }
     requestWindows.set(ip, { count: 1, resetAt: now + WINDOW_MS });
     return true;
   }
@@ -56,7 +61,7 @@ export function parsePayload(body: any) {
       : "";
     historyChars += text.length;
     if (!role || !text) throw Object.assign(new Error("Invalid conversation history"), { statusCode: 400 });
-    return { role, parts: [{ text }] };
+    return { role: role as "user" | "model", parts: [{ text }] };
   });
   if (historyChars > MAX_HISTORY_TEXT_CHARS) throw Object.assign(new Error("Conversation history is too long"), { statusCode: 413 });
 

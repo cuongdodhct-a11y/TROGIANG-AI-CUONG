@@ -1,7 +1,5 @@
 import { getGeminiClient, checkRequest, parsePayload, sendError } from "../../lib/gemini-server";
 
-export const config = { maxDuration: 30 };
-
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
