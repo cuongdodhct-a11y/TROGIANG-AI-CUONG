@@ -320,33 +320,10 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       });
 
       if (!response.ok || !response.body) {
-        // Fallback to unary endpoint if streaming response unavailable
-        const unaryRes = await fetch('/api/gemini/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt: userPrompt,
-            systemInstruction,
-            history: chatHistoryRef.current.slice(-10),
-          }),
-        });
-        if (!unaryRes.ok) {
-          const errData = await unaryRes.json().catch(() => ({}));
-          throw new Error(errData.error || `Server responded with ${unaryRes.status}`);
-        }
-        const data = await unaryRes.json();
-        const replyText = data.text || "";
-        if (replyText) {
-          setAiTranscription(replyText);
-          chatHistoryRef.current.push(
-            { role: 'user', parts: [{ text: userPrompt }] },
-            { role: 'model', parts: [{ text: replyText }] }
-          );
-          if (activationStateRef.current === 'active') {
-            speakText(replyText, false);
-          }
-        }
-        return;
+        // Do not retry a failed provider request through a second endpoint:
+        // 429/quota/5xx responses must not trigger duplicate Gemini calls.
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Dịch vụ AI phản hồi mã ${response.status || 'không xác định'}`);
       }
 
       stopTtsQueue();
@@ -373,12 +350,16 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
           const payload = trimmedLine.slice(5).trim();
           if (payload === '[DONE]') continue;
 
+          let parsed: any;
           try {
-            const parsed = JSON.parse(payload);
-            if (parsed.error) {
-              throw new Error(parsed.error);
-            }
-            if (parsed.text) {
+            parsed = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+          if (parsed.error) {
+            throw new Error(parsed.error);
+          }
+          if (parsed.text) {
               fullReply += parsed.text;
               sentenceBuffer += parsed.text;
               setAiTranscription(fullReply);
@@ -402,9 +383,6 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                   hasStartedSpeaking = true;
                 }
               }
-            }
-          } catch (e) {
-            // Ignore partial JSON parse errors
           }
         }
       }
@@ -431,6 +409,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       }
     } catch (err: any) {
       console.error("Fallback generateContent error:", err);
+      setError(err?.message || "Không thể kết nối dịch vụ AI. Vui lòng thử lại sau.");
     } finally {
       setIsAiThinking(false);
       isProcessingFallbackRef.current = false;
@@ -548,7 +527,9 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     }
   };
 
-  const startConnection = async (preferLive = true) => {
+  // Vercel runs this application as serverless functions and does not host
+  // a persistent Express/WebSocket server. Use the supported HTTP fallback.
+  const startConnection = async (_preferLive = false) => {
     if (isConnecting) return;
     setError(null);
     setIsConnecting(true);
@@ -563,140 +544,15 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
         },
       });
       streamRef.current = stream;
-
-      if (!preferLive) {
-        startFallbackConnection();
-        return;
-      }
-
-      // Connect to Live API via server WebSocket
-      let hasOpened = false;
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/api/live`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        ws.send(JSON.stringify({
-          type: 'init',
-          systemInstruction,
-          voiceName: 'Zephyr',
-        }));
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-
-          if (data.type === 'open') {
-            console.log("Live API connected via server");
-            hasOpened = true;
-            setEngineMode('live');
-            engineModeRef.current = 'live';
-            setIsConnected(true);
-            isSessionActiveRef.current = true;
-            setIsConnecting(false);
-
-            startMic(ws);
-            startSpeechRecognition();
-            return;
-          }
-
-          if (data.type === 'message') {
-            if (data.inputTranscription && !isAiSpeakingRef.current) {
-              setTranscription(data.inputTranscription);
-              if (isWakeWord(data.inputTranscription)) {
-                updateActivationState('active');
-              } else if (isStopWord(data.inputTranscription)) {
-                updateActivationState('standby');
-                return;
-              }
-            }
-
-            if (data.audio) {
-              if (activationStateRef.current === 'active') {
-                if (!isLiveTurnStreamingRef.current) {
-                  isLiveTurnStreamingRef.current = true;
-                  setAiTranscription("");
-                }
-                const audioData = base64ToArrayBuffer(data.audio);
-                const float32Data = int16ToFloat32(new Int16Array(audioData));
-                scheduleAudio(float32Data);
-              }
-            }
-
-            if (data.outputTranscription && activationStateRef.current === 'active') {
-              setAiTranscription(prev => prev ? prev + " " + data.outputTranscription : data.outputTranscription);
-            }
-
-            if (data.turnComplete) {
-              isLiveTurnStreamingRef.current = false;
-              scheduleSpeakingEndCheck();
-            }
-            return;
-          }
-
-          if (data.type === 'error') {
-            console.warn("Live API encounter:", data.error);
-            const errStr = String(data.error || "");
-            
-            // If service unavailable or transient error, automatically switch to reliable fallback engine!
-            if (!hasOpened || errStr.includes("unavailable") || errStr.includes("Network") || errStr.includes("503") || errStr.includes("not found")) {
-              console.log("Switching to Standard Gemini AI Engine due to Live API temporary unavailability...");
-              setError("Live Audio máy chủ đang bảo trì/quá tải. Đã chuyển sang Chế độ Giọng nói Dự phòng độ ổn định cao.");
-              startFallbackConnection();
-            } else {
-              setError("Đang tự động kết nối lại...");
-              clearTimeout(reconnectTimeoutRef.current);
-              reconnectTimeoutRef.current = setTimeout(() => {
-                startConnection(false);
-              }, 2000);
-            }
-            return;
-          }
-
-          if (data.type === 'close') {
-            console.log("Live API closed");
-            if (isSessionActiveRef.current && engineModeRef.current === 'live') {
-              startFallbackConnection();
-            }
-            return;
-          }
-        } catch (e) {
-          console.error("Error parsing Live message:", e);
-        }
-      };
-
-      ws.onerror = (e) => {
-        console.warn("Live API websocket error:", e);
-        if (!hasOpened) {
-          startFallbackConnection();
-        }
-      };
-
-      ws.onclose = () => {
-        console.log("Live API websocket closed");
-        if (isSessionActiveRef.current && engineModeRef.current === 'live') {
-          startFallbackConnection();
-        }
-      };
-
-      // Timeout safeguard in case websocket stalls
-      setTimeout(() => {
-        if (!hasOpened && isSessionActiveRef.current === false && isConnecting) {
-          console.log("Live API connection timeout -> switching to Standard Engine");
-          startFallbackConnection();
-        }
-      }, 5000);
-
+      startFallbackConnection();
     } catch (error: any) {
-      console.error("Failed to connect:", error);
-      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+      console.error("Failed to initialize voice input:", error);
+      if (error?.name === 'NotAllowedError' || error?.name === 'PermissionDeniedError') {
         setError("Không thể truy cập micro. Vui lòng cấp quyền micro cho trang web.");
         setIsConnecting(false);
       } else {
-        // Fallback to Standard Voice Chat
-        startFallbackConnection();
+        setError("Không thể khởi tạo micro. Vui lòng kiểm tra thiết bị và quyền truy cập.");
+        setIsConnecting(false);
       }
     }
   };
