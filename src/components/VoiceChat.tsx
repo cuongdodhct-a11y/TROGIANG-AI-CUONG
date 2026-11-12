@@ -320,33 +320,10 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       });
 
       if (!response.ok || !response.body) {
-        // Fallback to unary endpoint if streaming response unavailable
-        const unaryRes = await fetch('/api/gemini/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt: userPrompt,
-            systemInstruction,
-            history: chatHistoryRef.current.slice(-10),
-          }),
-        });
-        if (!unaryRes.ok) {
-          const errData = await unaryRes.json().catch(() => ({}));
-          throw new Error(errData.error || `Server responded with ${unaryRes.status}`);
-        }
-        const data = await unaryRes.json();
-        const replyText = data.text || "";
-        if (replyText) {
-          setAiTranscription(replyText);
-          chatHistoryRef.current.push(
-            { role: 'user', parts: [{ text: userPrompt }] },
-            { role: 'model', parts: [{ text: replyText }] }
-          );
-          if (activationStateRef.current === 'active') {
-            speakText(replyText, false);
-          }
-        }
-        return;
+        // Do not retry a failed provider request through a second endpoint:
+        // 429/quota/5xx responses must not trigger duplicate Gemini calls.
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Dịch vụ AI phản hồi mã ${response.status || 'không xác định'}`);
       }
 
       stopTtsQueue();
@@ -373,12 +350,16 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
           const payload = trimmedLine.slice(5).trim();
           if (payload === '[DONE]') continue;
 
+          let parsed: any;
           try {
-            const parsed = JSON.parse(payload);
-            if (parsed.error) {
-              throw new Error(parsed.error);
-            }
-            if (parsed.text) {
+            parsed = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+          if (parsed.error) {
+            throw new Error(parsed.error);
+          }
+          if (parsed.text) {
               fullReply += parsed.text;
               sentenceBuffer += parsed.text;
               setAiTranscription(fullReply);
@@ -402,9 +383,6 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
                   hasStartedSpeaking = true;
                 }
               }
-            }
-          } catch (e) {
-            // Ignore partial JSON parse errors
           }
         }
       }
@@ -431,6 +409,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
       }
     } catch (err: any) {
       console.error("Fallback generateContent error:", err);
+      setError(err?.message || "Không thể kết nối dịch vụ AI. Vui lòng thử lại sau.");
     } finally {
       setIsAiThinking(false);
       isProcessingFallbackRef.current = false;
