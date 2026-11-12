@@ -76,6 +76,6 @@ export function sendError(res: any, error: any) {
     : String(error?.message || "Request failed");
   if (!res.headersSent) res.status(safeStatus).json({ error: message });
   else {
-    try { res.write(`data: ${JSON.stringify({ error: message })}\\n\\n`); res.end(); } catch {}
+    try { res.write(`data: ${JSON.stringify({ error: message })}\n\n`); res.end(); } catch {}
   }
 }
