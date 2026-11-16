@@ -17,9 +17,9 @@ export default async function handler(req: any, res: any) {
     res.flushHeaders?.();
 
     for await (const text of streamAI(request)) {
-      res.write(`data: ${JSON.stringify({ text })}\\n\\n`);
+      res.write(\`data: \${JSON.stringify({ text })}\n\n\`);
     }
-    res.write("data: [DONE]\\n\\n");
+    res.write("data: [DONE]\n\n");
     return res.end();
   } catch (error: any) {
     console.error("[AI Gateway]", JSON.stringify({
