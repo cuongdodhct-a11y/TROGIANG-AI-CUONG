@@ -1,4 +1,4 @@
-import { getGeminiClient, checkRequest, parsePayload, sendError } from "../../lib/gemini-server";
+import { getGeminiClient, checkRequest, parsePayload, sendError } from "../../lib/gemini-server.js";
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
