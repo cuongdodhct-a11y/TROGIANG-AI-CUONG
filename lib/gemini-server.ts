@@ -71,9 +71,19 @@ export function parsePayload(body: any) {
 export function sendError(res: any, error: any) {
   const status = Number(error?.statusCode) || (Number(error?.status) >= 400 ? Number(error.status) : 500);
   const safeStatus = [400, 413, 429, 503].includes(status) ? status : 500;
-  const message = safeStatus === 500
-    ? "Dịch vụ AI tạm thời không thể xử lý yêu cầu. Vui lòng thử lại sau."
-    : String(error?.message || "Request failed");
+  const rawMessage = String(error?.message || "Request failed");
+  const isQuotaExhausted =
+    safeStatus === 429 &&
+    /RESOURCE_EXHAUSTED|quota|exceeded your current/i.test(rawMessage);
+  const message = isQuotaExhausted
+    ? "Gemini đã hết hạn mức sử dụng (quota). Hệ thống tạm ngừng gửi yêu cầu để tránh gọi lặp. Vui lòng kiểm tra hạn mức của API key trong Google AI Studio."
+    : safeStatus === 429
+      ? "Gemini đang giới hạn tần suất yêu cầu. Hệ thống đã tạm dừng gọi tiếp; vui lòng chờ trước khi thử lại."
+      : safeStatus === 503
+        ? "Dịch vụ AI chưa được cấu hình hoặc đang tạm thời không khả dụng."
+        : safeStatus === 500
+          ? "Dịch vụ AI tạm thời không thể xử lý yêu cầu. Vui lòng thử lại sau."
+          : rawMessage;
   if (!res.headersSent) res.status(safeStatus).json({ error: message });
   else {
     try { res.write(`data: ${JSON.stringify({ error: message })}\n\n`); res.end(); } catch {}
