@@ -67,6 +67,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   const isSessionActiveRef = useRef(false);
   const speechRecognizerRef = useRef<any>(null);
   const isProcessingFallbackRef = useRef(false);
+  const quotaBlockedRef = useRef(false);
   const reconnectTimeoutRef = useRef<any>(null);
   const fallbackDebounceTimeoutRef = useRef<any>(null);
   const pendingFallbackTranscriptRef = useRef<string>("");
@@ -303,7 +304,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
 
   // Process user speech when using Fallback Standard Engine with Streaming + Real-Time Google Search Grounding
   const processFallbackTurn = async (userPrompt: string) => {
-    if (isProcessingFallbackRef.current || isMutedRef.current || isAiSpeakingRef.current) return;
+    if (quotaBlockedRef.current || isProcessingFallbackRef.current || isMutedRef.current || isAiSpeakingRef.current) return;
     isProcessingFallbackRef.current = true;
     setIsAiThinking(true);
     setAiTranscription("");
@@ -323,7 +324,19 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
         // Do not retry a failed provider request through a second endpoint:
         // 429/quota/5xx responses must not trigger duplicate Gemini calls.
         const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.error || `Dịch vụ AI phản hồi mã ${response.status || 'không xác định'}`);
+        if (response.status === 429) {
+          quotaBlockedRef.current = true;
+          throw new Error(
+            typeof errData.error === 'string'
+              ? errData.error
+              : "Gemini đang hết hạn mức hoặc giới hạn tần suất. Hệ thống đã dừng gọi tiếp để tránh phát sinh thêm yêu cầu."
+          );
+        }
+        throw new Error(
+          typeof errData.error === 'string'
+            ? errData.error
+            : `Dịch vụ AI phản hồi mã ${response.status || 'không xác định'}`
+        );
       }
 
       stopTtsQueue();
@@ -532,6 +545,7 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   const startConnection = async (_preferLive = false) => {
     if (isConnecting) return;
     setError(null);
+    quotaBlockedRef.current = false;
     setIsConnecting(true);
     updateActivationState('standby');
 
