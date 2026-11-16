@@ -30,7 +30,7 @@ export default async function handler(req: any, res: any) {
     res.write("data: [DONE]\n\n");
     return res.end();
   } catch (error: any) {
-    console.error("[Gemini Stream]", error?.status || error?.statusCode || error?.name || "request_failed");
+    console.error("[Gemini Stream]", JSON.stringify({ name: error?.name, status: error?.status, statusCode: error?.statusCode, code: error?.code, message: String(error?.message || "request_failed").slice(0, 300) }));
     return sendError(res, error);
   }
 }

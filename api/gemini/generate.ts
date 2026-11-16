@@ -19,7 +19,7 @@ export default async function handler(req: any, res: any) {
     });
     return res.status(200).json({ text: result.text || "" });
   } catch (error: any) {
-    console.error("[Gemini Generate]", error?.status || error?.statusCode || error?.name || "request_failed");
+    console.error("[Gemini Generate]", JSON.stringify({ name: error?.name, status: error?.status, statusCode: error?.statusCode, code: error?.code, message: String(error?.message || "request_failed").slice(0, 300) }));
     return sendError(res, error);
   }
 }
