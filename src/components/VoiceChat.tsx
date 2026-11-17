@@ -430,9 +430,12 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
   };
 
   // Continuous speech recognition for keyword detection & fallback input
-  const startSpeechRecognition = () => {
+  const startSpeechRecognition = (): boolean => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
+    if (!SpeechRecognition) {
+      console.warn("SpeechRecognition is not supported by this browser.");
+      return false;
+    }
 
     try {
       if (speechRecognizerRef.current) {
@@ -507,8 +510,10 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
 
       recognizer.start();
       speechRecognizerRef.current = recognizer;
+      return true;
     } catch (e) {
       console.warn("Speech recognition initialization skipped:", e);
+      return false;
     }
   };
 
@@ -528,15 +533,26 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     try {
       setEngineMode('standard');
       engineModeRef.current = 'standard';
-      setIsConnecting(false);
-      setIsConnected(true);
-      isSessionActiveRef.current = true;
       updateActivationState('standby');
-      startSpeechRecognition();
-      setError(null);
-    } catch (err) {
-      setError("Không thể khởi tạo micro. Vui lòng cấp quyền micro trên trình duyệt.");
+      isSessionActiveRef.current = true;
+
+      // Standard mode uses the browser SpeechRecognition API, which manages
+      // microphone access itself. Do not require getUserMedia here: some
+      // browsers expose SpeechRecognition but not navigator.mediaDevices.
+      if (!startSpeechRecognition()) {
+        throw new Error(
+          "Trình duyệt không hỗ trợ nhận dạng giọng nói. Thầy hãy dùng Safari hoặc Chrome/Cốc Cốc bản mới và cấp quyền micro."
+        );
+      }
+
+      setIsConnected(true);
       setIsConnecting(false);
+      setError(null);
+    } catch (err: any) {
+      isSessionActiveRef.current = false;
+      setError(err?.message || "Không thể khởi tạo micro. Vui lòng cấp quyền micro trên trình duyệt.");
+      setIsConnecting(false);
+      setIsConnected(false);
     }
   };
 
@@ -550,24 +566,15 @@ export default function VoiceChat({ systemInstruction }: VoiceChatProps) {
     updateActivationState('standby');
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      streamRef.current = stream;
-      startFallbackConnection();
+      // This deployment uses the browser SpeechRecognition fallback.
+      // SpeechRecognition requests microphone permission independently;
+      // requiring getUserMedia here breaks browsers without mediaDevices.
+      await startFallbackConnection();
     } catch (error: any) {
       console.error("Failed to initialize voice input:", error);
-      if (error?.name === 'NotAllowedError' || error?.name === 'PermissionDeniedError') {
-        setError("Không thể truy cập micro. Vui lòng cấp quyền micro cho trang web.");
-        setIsConnecting(false);
-      } else {
-        setError("Không thể khởi tạo micro. Vui lòng kiểm tra thiết bị và quyền truy cập.");
-        setIsConnecting(false);
-      }
+      setError(error?.message || "Không thể khởi tạo micro. Vui lòng kiểm tra thiết bị và quyền truy cập.");
+      setIsConnecting(false);
+      setIsConnected(false);
     }
   };
 
